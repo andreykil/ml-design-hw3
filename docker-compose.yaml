@@ -9,12 +9,18 @@ services:
       ZOOKEEPER_TICK_TIME: 2000
     ports:
       - "2181:2181"
+    healthcheck:
+      test: ["CMD", "cub", "zk-ready", "localhost:2181", "5"]
+      interval: 5s
+      timeout: 8s
+      retries: 12
 
   # Сервис Kafka
   kafka:
     image: confluentinc/cp-kafka:7.3.0
     depends_on:
-      - zookeeper
+      zookeeper:
+        condition: service_healthy
     networks:
       - ml-scorer
     ports:
@@ -195,6 +201,7 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       TRAINING_DATA_DIR: /opt/airflow/training_data
       MODELS_DIR: /opt/airflow/models
+      REPORTS_DIR: /opt/airflow/reports
       FRAUD_SRC: /opt/airflow/fraud_src
     volumes:
       - ./dags:/opt/airflow/dags
@@ -202,6 +209,7 @@ services:
       - ./fraud_detector/src:/opt/airflow/fraud_src:ro
       - training_data:/opt/airflow/training_data
       - model_registry:/opt/airflow/models
+      - ./reports:/opt/airflow/reports
       - airflow_state:/opt/airflow/airflow_state
     ports:
       - "8081:8080"
@@ -213,7 +221,6 @@ services:
 
 networks:
   ml-scorer:
-    name: ml-scorer
     driver: bridge
 
 volumes:

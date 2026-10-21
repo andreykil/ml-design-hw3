@@ -9,6 +9,8 @@ import pandas as pd
 import psycopg2
 from dateutil.relativedelta import relativedelta
 
+from pipeline.settings import WINDOW_MONTHS
+
 logger = logging.getLogger(__name__)
 
 LABELED_COLUMNS = [
@@ -81,7 +83,7 @@ def read_training_state(conn) -> dict:
 
 
 def advance_training_state(conn, batch_month: date) -> None:
-    """Сдвигает окно обучения на месяц успешно опубликованного батча.
+    """Фиксирует месяц сохранённого и проверенного кандидата.
 
     Новое окно заканчивается batch_month и покрывает три месяца.
     next_batch_month становится следующим календарным месяцем.
@@ -89,7 +91,7 @@ def advance_training_state(conn, batch_month: date) -> None:
     не пропускал месяц.
     """
     window_end = batch_month
-    window_start = batch_month - relativedelta(months=2)
+    window_start = batch_month - relativedelta(months=WINDOW_MONTHS - 1)
     next_batch = month_end_exclusive(batch_month)
     with conn.cursor() as cur:
         cur.execute(
@@ -99,10 +101,12 @@ def advance_training_state(conn, batch_month: date) -> None:
                 window_end = %s,
                 next_batch_month = %s,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = 1
+            WHERE id = 1 AND next_batch_month = %s
             """,
-            (window_start, window_end, next_batch),
+            (window_start, window_end, next_batch, batch_month),
         )
+        if cur.rowcount != 1:
+            raise RuntimeError("Указатель месяца изменился до фиксации результата.")
     conn.commit()
     logger.info(
         "Состояние обновлено: окно %s — %s, следующий батч %s",
@@ -112,11 +116,11 @@ def advance_training_state(conn, batch_month: date) -> None:
     )
 
 
-def copy_labeled_frame(conn, frame: pd.DataFrame) -> None:
+def copy_labeled_frame(conn, frame: pd.DataFrame, commit: bool = True) -> None:
     """Дописывает строки в конец labeled_transactions через COPY.
 
     frame должен содержать колонки LABELED_COLUMNS. transaction_time
-    записывается как timestamp. Транзакция фиксируется в конце загрузки.
+    записывается как timestamp. commit=False оставляет фиксацию вызывающей задаче.
     """
     payload = frame.loc[:, LABELED_COLUMNS].copy()
     payload["transaction_time"] = pd.to_datetime(payload["transaction_time"])
@@ -134,5 +138,6 @@ def copy_labeled_frame(conn, frame: pd.DataFrame) -> None:
             f"COPY labeled_transactions ({column_list}) FROM STDIN WITH (FORMAT CSV)",
             buffer,
         )
-    conn.commit()
+    if commit:
+        conn.commit()
     logger.info("В labeled_transactions дописано %s строк.", len(payload))

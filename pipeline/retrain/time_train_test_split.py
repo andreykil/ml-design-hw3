@@ -1,10 +1,11 @@
 """Временной train/test split трёхмесячного окна."""
 
 import logging
+from pathlib import Path
 
 import pandas as pd
 
-from pipeline.settings import SPLITS_DIR
+from pipeline.artifacts import write_frame
 
 logger = logging.getLogger(__name__)
 
@@ -13,11 +14,12 @@ def time_train_test_split(window_info: dict) -> dict:
     """Делит окно по времени: два более ранних месяца в train, свежий месяц в test.
 
     Читает parquet окна из window_info, сортирует по transaction_time и
-    сохраняет сырые части в splits/train_raw.parquet и splits/test_raw.parquet.
+    сохраняет train_raw.parquet и test_raw.parquet в каталог запуска.
     Колонка времени остаётся, потому что препроцессинг сам строит календарные признаки.
     Возвращает пути к частям, месяц батча и подписи месяцев train и test.
+    Повтор перезаписывает только файлы своего запуска.
     """
-    SPLITS_DIR.mkdir(parents=True, exist_ok=True)
+    splits_dir = Path(window_info["dataset_path"]).parent
     frame = pd.read_parquet(window_info["dataset_path"])
     frame["transaction_time"] = pd.to_datetime(frame["transaction_time"])
     frame = frame.sort_values("transaction_time")
@@ -30,10 +32,10 @@ def time_train_test_split(window_info: dict) -> dict:
             f"Не удалось разрезать окно по времени: train={len(train)}, test={len(test)}"
         )
 
-    train_path = SPLITS_DIR / "train_raw.parquet"
-    test_path = SPLITS_DIR / "test_raw.parquet"
-    train.to_parquet(train_path, index=False)
-    test.to_parquet(test_path, index=False)
+    train_path = splits_dir / "train_raw.parquet"
+    test_path = splits_dir / "test_raw.parquet"
+    write_frame(train_path, train)
+    write_frame(test_path, test)
     train_months = sorted(periods.loc[periods < latest].unique().astype(str))
     logger.info(
         "Train месяцы %s (%s строк), test %s (%s строк).",

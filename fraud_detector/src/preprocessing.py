@@ -31,6 +31,11 @@ def haversine(lat1, lon1, lat2, lon2):
 
 
 def add_features(df):
+    """Строит признаки транзакций без изменения исходного DataFrame.
+
+    К семинарским признакам добавляет логарифм суммы, циклическое время
+    суток и флаг ночной операции.
+    """
     df_ = df.copy()
     df_['haversine'] = haversine(df_['lat'], df_['lon'],
                                  df_['merchant_lat'], df_['merchant_lon'])
@@ -41,11 +46,19 @@ def add_features(df):
     df_["hour"] = df_["transaction_time"].dt.hour
     df_["minute"] = df_["transaction_time"].dt.minute
     df_["weekend"] = (df_["transaction_time"].dt.dayofweek > 4).astype(int)
+
+    df_["amount_log"] = np.log1p(df_["amount"])
+    time_of_day = df_["hour"] + df_["minute"] / 60
+    angle = 2 * np.pi * time_of_day / 24
+    df_["time_sin"] = np.sin(angle)
+    df_["time_cos"] = np.cos(angle)
+    df_["is_night"] = (df_["hour"] < 6).astype(int)
     return df_.drop(columns=["transaction_time", "name_1", "name_2", "street"])
 
 
 # Main preprocessing function
 def run_preproc(input_df):
+    """Применяет общий препроцессинг для обучения и онлайн-скоринга."""
     # Add features
     output_df = add_features(input_df)
     logger.info('Added new features. Output shape: %s', output_df.shape)

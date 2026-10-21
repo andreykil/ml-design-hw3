@@ -2,11 +2,13 @@
 
 import calendar
 import logging
+import json
 
 import pandas as pd
 
 from pipeline.db import LABELED_COLUMNS, get_conn
-from pipeline.settings import SAMPLE_SIZE, SUPPLY_BATCH, TRAINING_DIR
+from pipeline.settings import SAMPLE_SIZE
+from pipeline.artifacts import run_directory, write_frame, write_json
 
 logger = logging.getLogger(__name__)
 
@@ -39,15 +41,19 @@ def shift_into_month(frame: pd.DataFrame, month_start: pd.Timestamp) -> pd.DataF
     return shifted
 
 
-def sample_next_month() -> dict:
+def sample_next_month(run_id: str) -> dict:
     """Сэмплирует строки витрины и готовит батч следующего календарного месяца.
 
     Из labeled_transactions случайно берётся до SAMPLE_SIZE наблюдений.
     Месяц батча — следующий после max(transaction_time). Времена переносятся
-    в этот месяц, результат пишется в supply_batch.parquet.
+    в этот месяц, результат пишется в каталог запуска.
     Витрину не изменяет. Возвращает путь к файлу и первое число месяца батча.
+    Повтор возвращает тот же сохранённый батч, даже после его загрузки в БД.
     """
-    TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    directory = run_directory("supply", run_id)
+    manifest = directory / "batch.json"
+    if manifest.exists():
+        return json.loads(manifest.read_text())
     conn = get_conn()
     try:
         with conn.cursor() as cur:
@@ -73,7 +79,8 @@ def sample_next_month() -> dict:
 
     month_start = next_month_start(max_time)
     batch = shift_into_month(frame, month_start)
-    batch.to_parquet(SUPPLY_BATCH, index=False)
+    batch_path = directory / "batch.parquet"
+    write_frame(batch_path, batch)
     logger.info(
         "Батч %s: %s строк из %s, время %s — %s",
         month_start.strftime("%Y-%m"),
@@ -82,8 +89,11 @@ def sample_next_month() -> dict:
         batch["transaction_time"].min(),
         batch["transaction_time"].max(),
     )
-    return {
-        "batch_path": str(SUPPLY_BATCH),
+    result = {
+        "batch_path": str(batch_path),
         "batch_month": month_start.date().isoformat(),
         "rows": int(len(batch)),
+        "run_id": run_id,
     }
+    write_json(manifest, result)
+    return result

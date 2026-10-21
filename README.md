@@ -1,175 +1,90 @@
-# Антифрод: поток транзакций, скоринг и переобучение
+# Запуск и проверка проекта
 
-Учебный проект обнаружения мошеннических транзакций. Kafka несёт непрерывный поток событий, CatBoost скорит их текущей моделью, а Airflow по расписанию дописывает размеченные месяцы и переобучает модель.
+Нужны работающий Docker Desktop и Docker Compose v2 или новее. Порты 2181, 5432, 8080, 8081 и 9095 должны быть свободны.
 
-Датасет можно найти [здесь](https://www.kaggle.com/competitions/teta-ml-1-2025/data). В этом занятии используется файл `train.csv` из каталога практики занятия 07. Путь задаётся переменной `TRAIN_DATA_CSV`.
+Команды выполняются из корня репозитория — папки с `docker-compose.yaml`.
 
----
+## Запуск
 
-## Архитектура
+1. Положите размеченный `train.csv` в папку `data/` в корне репозитория.
+2. Создайте `.env`. В шаблоне уже указан `TRAIN_DATA_CSV=./data/train.csv`; при другом расположении файла измените этот путь.
+3. Запустите:
 
-```mermaid
-flowchart LR
-  csv[train.csv] --> loader[data_loader]
-  csv --> simulator[transaction_simulator]
-  loader --> showcase[labeled_transactions]
-  etlDag[supply_labeled_batch] --> showcase
-  showcase --> retrainDag[retrain_catboost]
-  retrainDag --> models[model_registry]
-  simulator --> transactions[Kafka transactions]
-  transactions --> scorer[fraud_detector]
-  models --> scorer
-  scorer --> scoring[Kafka scoring]
-  scoring --> writer[scoring_writer]
-  writer --> scores[scores]
-```
+   ```bash
+   docker compose up --build -d
+   docker compose ps -a
+   ```
 
-| Сервис | Описание |
-|--------|----------|
-| **Kafka** | Шина сообщений между симулятором потока, скорингом и записью результатов |
-| **Zookeeper** | Управление кластером Kafka |
-| **Kafka UI** | Просмотр топиков `transactions` и `scoring` |
-| **transaction_simulator** | Бесконечно шлёт в `transactions` случайные строки CSV. У каждой новый `transaction_id` и `transaction_time`, равный текущему моменту, формат `YYYY-MM-DD HH:MM` |
-| **fraud_detector** | Препроцессинг и инференс CatBoost. Перед каждым сообщением читает `/models/latest.txt` и подхватывает `my_catboost_<версия>.cbm` без перезапуска |
-| **scoring_writer** | Читает топик `scoring` и пишет `score`, `fraud_flag` и `model_version` в PostgreSQL |
-| **PostgreSQL** | Витрина `labeled_transactions`, состояние окна `training_state` и таблица `scores` |
-| **data_loader** | При старте один раз загружает весь CSV в витрину и собирает исходное окно обучения: январь–март 2019 |
-| **airflow** | Два DAG каждые 5 минут: поставка нового размеченного месяца и переобучение CatBoost |
+Первый запуск скачивает образы и зависимости, затем загружает CSV. `data_loader` и `kafka-setup` должны завершиться с кодом `0`; остальные сервисы продолжают работать.
 
-Общий том `model_registry` смонтирован в Airflow как `/opt/airflow/models` и в `fraud_detector` как `/models`. Логика задач вынесена в `pipeline/`. Файлы в `dags/` только связывают задачи.
+Доступны:
 
----
+- Airflow: http://localhost:8081 — `admin` / `admin`.
+- Kafka UI: http://localhost:8080 — топики `transactions` и `scoring`.
+- PostgreSQL: `localhost:5432`, БД `fraud_db`, пользователь `fraud_user`, пароль из `.env`.
+- Kafka с хоста: `localhost:9095`.
 
-## Структура проекта
-
-```
-.
-├── fraud_detector/           # Онлайн-скоринг
-├── transaction_simulator/    # Непрерывная поставка транзакций в Kafka
-├── scoring_writer/           # Запись скоров в PostgreSQL
-├── data_loader/              # Первичная загрузка размеченной витрины
-├── dags/
-│   ├── retrain_catboost.py   # DAG переобучения
-│   └── supply_labeled_batch.py
-├── pipeline/
-│   ├── db.py                 # Подключение к витрине и training_state
-│   ├── retrain/              # Функции задач переобучения
-│   └── supply/               # Функции задач поставки месяца
-├── airflow/                  # Образ Airflow с CatBoost
-├── docker-compose.yaml
-├── .env.example
-└── README.md
-```
-
----
-
-## Что происходит после запуска
-
-1. `data_loader` копирует `TRAIN_DATA_CSV` в `labeled_transactions` и сохраняет окно января–марта 2019. Повторный старт без `down -v` витрину не перезаливает.
-2. `transaction_simulator` каждые 0.1 секунды отправляет в Kafka случайную транзакцию с текущим временем.
-3. `fraud_detector` скорит поток моделью из общего каталога. До первого переобучения версия — `initial`: в каталог копируется модель из образа.
-4. `scoring_writer` складывает результат в `scores`, включая `model_version`.
-5. DAG `supply_labeled_batch` каждые 5 минут берёт из витрины 100 тысяч случайных строк, переносит их время в следующий календарный месяц и дописывает батч. Наблюдения старше трёх лет относительно самого нового месяца удаляются.
-6. DAG `retrain_catboost` каждые 5 минут забирает следующий месяц витрины, начиная с апреля 2019, сдвигает трёхмесячное окно, учит CatBoost и публикует `my_catboost_<timestamp>.cbm`.
-
-Переобучение и поставка идут по разным указателям месяца. `retrain_catboost` читает исторические месяцы с апреля 2019. `supply_labeled_batch` каждый раз создаёт месяц после максимальной даты витрины, первый такой месяц — апрель 2020. Окно обучения ещё долго не доходит до этих батчей, и очистка трёх лет его не затрагивает.
-
-Оба DAG можно запустить вручную в Airflow, не дожидаясь расписания. Если очередного месяца в витрине ещё нет, задачи переобучения помечаются как skipped.
-
----
-
-## Технологии
-
-- **Python 3.11**
-- **ML**: CatBoost, pandas, numpy
-- **Kafka**: потоковая обработка данных
-- **PostgreSQL**: витрина размеченных данных и результаты скоринга
-- **Airflow 2.10**: поставка месячных батчей и переобучение модели
-- **Docker / Docker Compose**: оркестрация микросервисов
-
----
-
-## Как запустить проект
-
-### 1. Клонируйте репозиторий
+## Проверка скоринга
 
 ```bash
-git clone https://github.com/NikitaMalykhin/mlops_realtime_fraud_detector_airflow.git
-cd mlops_realtime_fraud_detector_airflow
+docker compose logs --tail=30 data_loader fraud_detector scoring_writer
+docker compose exec postgres psql -U fraud_user -d fraud_db -c \
+  "SELECT transaction_id, score, fraud_flag, model_version, created_at FROM scores ORDER BY id DESC LIMIT 10;"
 ```
 
-### 2. Создайте `.env` файл
+Повторите SQL через несколько секунд: должны появиться новые транзакции. В Kafka UI в сообщениях `scoring` есть `score`, `fraud_flag`, `model_version`.
+
+## Проверка DAG и обновления модели
+
+Собственный препроцессинг в `fraud_detector/src/preprocessing.py` дополняет семинарские признаки: `amount_log = log1p(amount)`, `time_sin` и `time_cos` для циклического времени суток с учетом минут, `is_night` для операций с 00:00 до 05:59. Преобразования одинаково применяются в DAG и онлайн-скоринге.
+
+Все три DAG выполняются каждые 5 минут, `catchup=False`, одновременно выполняется не более одного запуска каждого DAG.
+
+1. `supply_labeled_batch`: выборка до 100 000 строк → перенос в следующий месяц → запись → удаление истории старше 3 лет.
+2. `retrain_catboost`: извлечение месяца → сборка окна → временной split → preprocessing → обучение → сравнение моделей → условная публикация.
+3. `data_quality`: снимок текущего окна → проверки → HTML-отчет. Успешные проверки дают зеленый DAG; нарушения — красную задачу `write_report`, при этом отчет уже сохранен.
+
+Окно обучения — 3 месяца: два ранних месяца идут в train, последний в test. У DAG поставки и переобучения разные указатели: переобучение сначала проходит исторические месяцы CSV.
+
+Каждый запуск сохраняет свой месяц и снимок данных, а указатель обновляется только после сохранения кандидата, решения о публикации и окна. Повтор не сдвигает окно второй раз и не возвращает старую production-версию.
+
+Проверить файлы модели и текущую версию:
 
 ```bash
-cp .env.example .env
+docker compose exec airflow sh -c 'cat /opt/airflow/models/latest.txt; ls -lh /opt/airflow/models'
+docker compose exec postgres psql -U fraud_user -d fraud_db -c \
+  "SELECT model_version, COUNT(*) FROM scores GROUP BY model_version ORDER BY model_version;"
+docker compose exec postgres psql -U fraud_user -d fraud_db -c \
+  "SELECT window_start, window_end, next_batch_month FROM training_state;"
 ```
 
-В `TRAIN_DATA_CSV` укажите путь к размеченному `train.csv` на вашей машине.
+При принятии кандидата появляются `my_catboost_<версия>.cbm` и файл метрик, меняется `latest.txt`. Через несколько секунд новые строки `scores` должны содержать эту версию. При отклонении production-версия сохраняется. До первой публикации версия — `initial`.
 
-### 3. Запустите контейнеры
+## Проверка качества модели
 
-```bash
-docker compose up --build
-```
+CatBoost обучается на CPU, фиксированные 100 итераций. Test-месяц не используется для подбора числа итераций. Задача `evaluate_model` заново оценивает кандидата и действующую модель на одном и том же свежем test-месяце, выбирая признаки каждой модели по `feature_names_`.
 
-Нужны [Docker](https://docs.docker.com/engine/install/) и Docker Compose. Первый запуск скачивает образы и загружает витрину, это занимает несколько минут.
+Публикация разрешена, если одновременно `ROC-AUC кандидата >= ROC-AUC production` и `F1 кандидата >= F1 production`. Для F1 используется тот же порог `score > 0.5`, что и в скоринге.
 
-## Доступные сервисы
+После сохранения и проверки кандидата окно сдвигается на месяц даже при отклонении: следующий запуск обрабатывает новые данные, а скоринг продолжает использовать прежнюю модель.
 
-| Сервис | URL |
-|--------|-----|
-| **Kafka UI** | http://localhost:8080 |
-| **Airflow** | http://localhost:8081 (`admin` / `admin`) |
-| **PostgreSQL** | `localhost:5432`, база `fraud_db` |
+Метрики обеих моделей и решение о публикации находятся в `/opt/airflow/models/candidates/*.metrics.json`.
 
-Пользователь и пароль Postgres задаются в `.env` (`fraud_user` / `fraud_pass` в шаблоне).
+## Data Quality и HTML-отчёты
 
-Посмотреть витрины из контейнера:
+Проверяется все текущее зафиксированное трехмесячное окно из PostgreSQL. Это отдельный диагностический DAG, он не блокирует переобучение. Правила требуют нулевого числа нарушений:
 
-```bash
-docker compose exec postgres psql -U fraud_user -d fraud_db
-```
+1. Выборка не пустая.
+2. Присутствуют все столбцы `LABELED_COLUMNS`.
+3. `transaction_time` заполнен и корректен.
+4. `target` заполнен и принимает только `0` или `1`.
+5. `amount` — конечное неотрицательное число.
+6. `population_city` — конечное неотрицательное число.
+7. Все координаты заполнены и конечны; широта в `[-90, 90]`, долгота в `[-180, 180]`.
+8. Шесть категориальных признаков `CAT_FEATURES` заполнены и не содержат пустых строк.
+9. В окне ровно три ожидаемых последовательных календарных месяца.
+10. И в train, и в test присутствуют оба класса.
 
----
+В HTML для каждого правила показаны PASS/FAIL и число нарушений.
 
-## Таблицы PostgreSQL
-
-Таблица `scores`:
-
-| Поле | Тип | Описание |
-|------|-----|----------|
-| id | SERIAL | Уникальный ID |
-| transaction_id | TEXT | Идентификатор транзакции |
-| score | FLOAT | Вероятность мошенничества, порог 0.5 |
-| fraud_flag | INT | 1, если score больше 0.5, иначе 0 |
-| model_version | TEXT | Версия CatBoost, которая посчитала скор |
-| created_at | TIMESTAMP | Время записи |
-
-`labeled_transactions` — витрина размеченных транзакций. `training_state` хранит границы трёхмесячного окна обучения и месяц следующего батча.
-
-Последние скоры:
-
-```sql
-SELECT transaction_id, score, fraud_flag, model_version, created_at
-FROM scores
-ORDER BY created_at DESC
-LIMIT 20;
-```
-
-Модели, которые опубликовал DAG:
-
-```bash
-docker compose exec airflow ls -la /opt/airflow/models
-```
-
----
-
-## Как смотреть демонстрацию
-
-1. В Kafka UI топик `transactions` пополняется каждые 0.1 секунды, топик `scoring` — ответами модели.
-2. В Airflow откройте `supply_labeled_batch` и `retrain_catboost`. Кнопка Trigger запускает прогон сразу.
-3. После публикации модели новые сообщения в `scores` получают свежий `model_version`.
-
-### Очистка
-
-`docker compose down -v` удаляет контейнеры вместе с витриной, окном обучения, реестром моделей и состоянием Airflow. Следующий запуск снова загрузит CSV.
+Каталог отчетов `/opt/airflow/reports` расположен рядом с `/opt/airflow/models` и смонтирован в локальную папку `reports/`. История хранится в `dq_<id>.html`, последний отчет — `latest.html`.

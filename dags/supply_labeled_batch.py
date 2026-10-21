@@ -38,7 +38,7 @@ from pipeline.supply.sample_next_month import sample_next_month
 )
 def supply_labeled_batch():
     """Связывает выборку месяца, дозапись в витрину и очистку старых данных."""
-    sampled = task(sample_next_month, task_id="sample_next_month")()
+    sampled = task(sample_next_month, task_id="sample_next_month")(run_id="{{ run_id }}")
     appended = task(append_labeled_batch, task_id="append_labeled_batch")(sampled)
     task(prune_old_months, task_id="prune_old_months")(appended)
 
